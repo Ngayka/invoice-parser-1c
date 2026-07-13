@@ -1,4 +1,4 @@
-import fitz
+import pymupdf
 
 from app.pdf.exceptions import PdfParsingError
 
@@ -6,7 +6,7 @@ from app.pdf.exceptions import PdfParsingError
 class PdfReader:
     def extract_text(self, content: bytes) -> str:
         try:
-            document = fitz.open(
+            document = pymupdf.open(
                 stream=content,
                 filetype="pdf",
             )

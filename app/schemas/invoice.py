@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date as Date
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -20,10 +20,7 @@ class InvoiceItem(BaseModel):
 
 class InvoiceData(BaseModel):
     number: str | None = None
-    date: date | None = None
+    date: Date | None = None
     supplier: SupplierRaw
     items: list[InvoiceItem] = []
-
-    subtotal: Decimal | None = None
-    vat: Decimal | None = None
     total: Decimal | None = None

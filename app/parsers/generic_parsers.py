@@ -9,6 +9,22 @@ from app.schemas.invoice import (
 )
 
 
+UKRAINIAN_MONTHS = {
+    "січня": 1,
+    "лютого": 2,
+    "березня": 3,
+    "квітня": 4,
+    "травня": 5,
+    "червня": 6,
+    "липня": 7,
+    "серпня": 8,
+    "вересня": 9,
+    "жовтня": 10,
+    "листопада": 11,
+    "грудня": 12,
+}
+
+
 class GenericInvoiceParser:
     def parse(self, text: str) -> InvoiceData:
         return InvoiceData(
@@ -16,22 +32,23 @@ class GenericInvoiceParser:
             date=self._parse_date(text),
             supplier=self._parse_supplier(text),
             items=self._parse_items(text),
-            subtotal=self._parse_subtotal(text),
-            vat=self._parse_vat(text),
+            # unit=self._parse_units_of_measure(text),
+            # quantity=self._parse_quantity(text),
             total=self._parse_total(text),
         )
 
     def _parse_number(self, text: str) -> str | None:
         patterns = [
             re.compile(
-                r"(?:рахунок(?:-фактура)?|рахунок на оплату)"
-                r"\s*(?:№|N)?\s*"
-                r"([A-Za-zА-Яа-яІіЇїЄєҐґ0-9/_-]+)",
+                r"(?:рахунок(?:-фактура)?(?:\s+на\s+оплату)?"
+                r"|видаткова\s+накладна)"
+                r"\s*№\s*"
+                r"([A-Za-zА-Яа-яІіЇїЄєҐґ0-9/_-]+)"
+                r"\s+від\b",
                 re.IGNORECASE,
             ),
             re.compile(
-                r"(?:invoice)"
-                r"\s*(?:№|No\.?|number)?\s*"
+                r"invoice\s*(?:№|No\.?|number)\s*"
                 r"([A-Za-z0-9/_-]+)",
                 re.IGNORECASE,
             ),
@@ -46,36 +63,55 @@ class GenericInvoiceParser:
         return None
 
     def _parse_date(self, text: str) -> date | None:
-        patterns = [
-            (
-                re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b"),
-                "%d.%m.%Y",
-            ),
-            (
-                re.compile(r"\b(\d{2}/\d{2}/\d{4})\b"),
-                "%d/%m/%Y",
-            ),
-            (
-                re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"),
-                "%Y-%m-%d",
-            ),
-        ]
+        numeric_pattern = re.compile(
+            r"(?:рахунок(?:-фактура)?(?:\s+на\s+оплату)?"
+            r"|видаткова\s+накладна)"
+            r"\s*№\s*[A-Za-zА-Яа-яІіЇїЄєҐґ0-9/_-]+"
+            r"\s+від\s+"
+            r"(\d{1,2}[./]\d{1,2}[./]\d{4})",
+            re.IGNORECASE,
+        )
 
-        for pattern, date_format in patterns:
-            match = pattern.search(text)
+        match = numeric_pattern.search(text)
 
-            if not match:
-                continue
+        if match:
+            raw_date = match.group(1)
 
-            try:
-                return datetime.strptime(
-                    match.group(1),
-                    date_format,
-                ).date()
-            except ValueError:
-                continue
+            for date_format in ("%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(
+                        raw_date,
+                        date_format,
+                    ).date()
+                except ValueError:
+                    continue
 
-        return None
+        text_date_pattern = re.compile(
+            r"(?:рахунок(?:-фактура)?(?:\s+на\s+оплату)?"
+            r"|видаткова\s+накладна)"
+            r"\s*№\s*[A-Za-zА-Яа-яІіЇїЄєҐґ0-9/_-]+"
+            r"\s+від\s+"
+            r"(\d{1,2})\s+"
+            r"(січня|лютого|березня|квітня|травня|червня|"
+            r"липня|серпня|вересня|жовтня|листопада|грудня)"
+            r"\s+(\d{4})",
+            re.IGNORECASE,
+        )
+
+        match = text_date_pattern.search(text)
+
+        if not match:
+            return None
+
+        day = int(match.group(1))
+        month_name = match.group(2).lower()
+        year = int(match.group(3))
+
+        return date(
+            year=year,
+            month=UKRAINIAN_MONTHS[month_name],
+            day=day,
+        )
 
     def _parse_supplier(self, text: str) -> SupplierRaw:
         return SupplierRaw(
@@ -85,39 +121,71 @@ class GenericInvoiceParser:
         )
 
     def _parse_items(self, text: str) -> list[InvoiceItem]:
-        """
-        Таблична частина залежить не від постачальника,
-        а від того, як PDF віддає текст.
-
-        Поки повертаємо порожній список.
-        Після аналізу реальних PDF сюди додається
-        універсальна логіка пошуку рядків таблиці.
-        """
-        return []
-
-    def _parse_subtotal(self, text: str) -> Decimal | None:
         patterns = [
-            re.compile(
-                r"(?:сума без пдв|всього без пдв|разом без пдв)"
-                r"\s*[:\-]?\s*"
-                r"([\d\s\u00a0]+[,.]\d{2})",
-                re.IGNORECASE,
-            ),
+            {
+                "pattern": re.compile(
+                    r"(?m)^\s*"
+                    r"\d+\s+"  # номер рядка
+                    r"\S+\s+"  # код / артикул
+                    r"(.+?)\s+"  # назва
+                    r"(\d+(?:[,.]\d+)?)\s+"  # quantity
+                    r"([A-Za-zА-Яа-яІіЇїЄєҐґ.]+)\s+"  # unit
+                    r"([\d\s\u00a0]+[,.]\d{2})\s+"  # price
+                    r"([\d\s\u00a0]+[,.]\d{2})"  # total
+                    r"\s*$"
+                ),
+                "name_group": 1,
+                "quantity_group": 2,
+                "unit_group": 3,
+                "price_group": 4,
+                "total_group": 5,
+            },
+            {
+                "pattern": re.compile(
+                    r"(?m)^\s*"
+                    r"\d+\s+"
+                    r"\S+\s+"
+                    r"(.+?)\s+"
+                    r"([A-Za-zА-Яа-яІіЇїЄєҐґ.]+)\s+"  # unit
+                    r"(\d+(?:[,.]\d+)?)\s+"  # quantity
+                    r"([\d\s\u00a0]+[,.]\d{2})\s+"
+                    r"([\d\s\u00a0]+[,.]\d{2})"
+                    r"\s*$"
+                ),
+                "name_group": 1,
+                "unit_group": 2,
+                "quantity_group": 3,
+                "price_group": 4,
+                "total_group": 5,
+            },
         ]
 
-        return self._find_decimal(text, patterns)
+        items: list[InvoiceItem] = []
 
-    def _parse_vat(self, text: str) -> Decimal | None:
-        patterns = [
-            re.compile(
-                r"(?:пдв(?:\s*\d{1,2}\s*%)?)"
-                r"\s*[:\-]?\s*"
-                r"([\d\s\u00a0]+[,.]\d{2})",
-                re.IGNORECASE,
-            ),
-        ]
+        for config in patterns:
+            pattern = config["pattern"]
 
-        return self._find_decimal(text, patterns)
+            for match in pattern.finditer(text):
+                item = InvoiceItem(
+                    name=match.group(config["name_group"]).strip(),
+                    unit=match.group(config["unit_group"]).strip(),
+                    quantity=self._to_decimal(
+                        match.group(config["quantity_group"])
+                    ),
+                    price=self._to_decimal(
+                        match.group(config["price_group"])
+                    ),
+                    total=self._to_decimal(
+                        match.group(config["total_group"])
+                    ),
+                )
+
+                items.append(item)
+
+            if items:
+                break
+
+        return items
 
     def _parse_total(self, text: str) -> Decimal | None:
         patterns = [
@@ -141,7 +209,7 @@ class GenericInvoiceParser:
                 re.IGNORECASE,
             ),
             re.compile(
-                r"\b((?:ТОВ|ПП|ФОП|АТ|ПрАТ|ПАТ)"
+                r"\b((?:ТОВ|ПП|ФОП|АТ|ПрАТ|ПАТ|товариство з обмеженою відповідальністю|приватне підприємство|фізична особа підприємець)"
                 r"\s*[«\"']?[^,\n]{2,100}[»\"']?)",
                 re.IGNORECASE,
             ),
@@ -159,7 +227,7 @@ class GenericInvoiceParser:
     def _find_tax_code(text: str) -> str | None:
         patterns = [
             re.compile(
-                r"(?:код\s+єдрпоу|єдрпоу)"
+                r"(?:код\s+єдрпоу|єдрпоу|дрфо)"
                 r"\s*[:№]?\s*(\d{8})",
                 re.IGNORECASE,
             ),
