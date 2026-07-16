@@ -12,15 +12,28 @@ class SupplierRaw(BaseModel):
 
 class InvoiceItem(BaseModel):
     name: str
-    unit: str | None = None
-    quantity: Decimal | None = Field(default=None, gt=0)
-    price: Decimal | None = Field(default=None, ge=0)
-    total: Decimal | None = Field(default=None, ge=0)
+    unit: str
+    quantity: Decimal
+
+    source_price: Decimal
+    source_total: Decimal
+
+    price_net: Decimal | None = None
+    price_gross: Decimal | None = None
+
+    total_net: Decimal | None = None
+    total_gross: Decimal | None = None
 
 
 class InvoiceData(BaseModel):
-    number: str | None = None
-    date: Date | None = None
+    number: str
+    date: Date
     supplier: SupplierRaw
-    items: list[InvoiceItem] = []
-    total: Decimal | None = None
+    items: list[InvoiceItem]
+
+    vat_mode: str
+    vat_rate: Decimal | None = None
+
+    total_net: Decimal | None = None
+    vat_total: Decimal | None = None
+    total_gross: Decimal

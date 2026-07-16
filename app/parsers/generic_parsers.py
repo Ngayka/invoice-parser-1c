@@ -2,12 +2,14 @@ import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
+from app.services.vat_service import VatMode, detect_vat_mode
+
 from app.schemas.invoice import (
     InvoiceData,
     InvoiceItem,
     SupplierRaw,
 )
-
+from app.services.vat_service import VatMode
 
 UKRAINIAN_MONTHS = {
     "січня": 1,
@@ -27,14 +29,21 @@ UKRAINIAN_MONTHS = {
 
 class GenericInvoiceParser:
     def parse(self, text: str) -> InvoiceData:
+        vat_mode = detect_vat_mode(text)
+
+        total_net, vat_total, total_gross = self._parse_invoice_totals(
+            text,
+            vat_mode,
+        )
         return InvoiceData(
             number=self._parse_number(text),
             date=self._parse_date(text),
             supplier=self._parse_supplier(text),
             items=self._parse_items(text),
-            # unit=self._parse_units_of_measure(text),
-            # quantity=self._parse_quantity(text),
-            total=self._parse_total(text),
+            vat_mode=vat_mode,
+            total_net=total_net,
+            vat_total=vat_total,
+            total_gross=total_gross,
         )
 
     def _parse_number(self, text: str) -> str | None:
@@ -121,7 +130,71 @@ class GenericInvoiceParser:
         )
 
     def _parse_items(self, text: str) -> list[InvoiceItem]:
+        items: list[InvoiceItem] = []
+
+        # Вирізаємо лише частину документа з товарами.
+        table_match = re.search(
+            r"Сума без ПДВ\s*\n(?P<table>.*?)\nВсього:",
+            text,
+            flags=re.DOTALL,
+        )
+
+        if table_match:
+            table_text = table_match.group("table")
+
+            vertical_pattern = re.compile(
+                r"(?ms)"
+                r"^\s*\d+\s*\n"  # номер рядка
+                r"(?P<name>.+?)\n"  # назва, може займати кілька рядків
+                r"(?P<quantity>\d+(?:[,.]\d+)?)\s+"
+                r"(?P<unit>[A-Za-zА-Яа-яІіЇїЄєҐґ.]+)\s*\n"
+                r"(?P<price>[\d\s\u00a0]+[,.]\d{2})\s*\n"
+                r"(?P<total>[\d\s\u00a0]+[,.]\d{2})"
+                r"(?=\s*(?:\n\d+\s*\n|\Z))"
+            )
+
+            for match in vertical_pattern.finditer(table_text):
+                # Назва може містити кілька рядків — об'єднуємо їх.
+                name = " ".join(
+                    line.strip()
+                    for line in match.group("name").splitlines()
+                    if line.strip()
+                )
+
+                items.append(
+                    InvoiceItem(
+                        name=name,
+                        unit=match.group("unit").strip(),
+                        quantity=self._to_decimal(
+                            match.group("quantity")
+                        ),
+                        source_price=self._to_decimal(
+                            match.group("price")
+                        ),
+                        source_total=self._to_decimal(
+                            match.group("total")
+                        ),
+                    )
+                )
+
+        if items:
+            return items
+
         patterns = [
+            {
+                "pattern": re.compile(
+                    r"(?m)^\s*"
+                    r"\d+\s+"  # номер рядка
+                    r"(?P<name>.+?)\s+"  # назва товару
+                    r"\d{4}(?:\s+\d{2}){2,3}\s*[A-Za-zА-Яа-яІіЇїЄєҐґ]?\s+"  # УКТЗЕД
+                    r"(?P<quantity>\d+(?:[,.]\d+)?)\s+"
+                    r"(?P<unit>[A-Za-zА-Яа-яІіЇїЄєҐґ.]+)\s+"
+                    r"(?P<price>[\d\s\u00a0]+[,.]\d{2})\s+"
+                    r"(?P<total>[\d\s\u00a0]+[,.]\d{2})"
+                    r"\s*$"
+                ),
+                "named_groups": True,
+            },
             {
                 "pattern": re.compile(
                     r"(?m)^\s*"
@@ -163,42 +236,121 @@ class GenericInvoiceParser:
         items: list[InvoiceItem] = []
 
         for config in patterns:
-            pattern = config["pattern"]
+            matched_items: list[InvoiceItem] = []
 
-            for match in pattern.finditer(text):
-                item = InvoiceItem(
-                    name=match.group(config["name_group"]).strip(),
-                    unit=match.group(config["unit_group"]).strip(),
-                    quantity=self._to_decimal(
-                        match.group(config["quantity_group"])
-                    ),
-                    price=self._to_decimal(
-                        match.group(config["price_group"])
-                    ),
-                    total=self._to_decimal(
-                        match.group(config["total_group"])
-                    ),
-                )
+            for match in config["pattern"].finditer(text):
+                if config.get("named_groups"):
+                    item = InvoiceItem(
+                        name=match.group("name").strip(),
+                        unit=match.group("unit").strip(),
+                        quantity=self._to_decimal(
+                            match.group("quantity")
+                        ),
+                        source_price=self._to_decimal(
+                            match.group("price")
+                        ),
+                        source_total=self._to_decimal(
+                            match.group("total")
+                        ),
+                    )
+                else:
+                    item = InvoiceItem(
+                        name=match.group(
+                            config["name_group"]
+                        ).strip(),
+                        unit=match.group(
+                            config["unit_group"]
+                        ).strip(),
+                        quantity=self._to_decimal(
+                            match.group(
+                                config["quantity_group"]
+                            )
+                        ),
+                        source_price=self._to_decimal(
+                            match.group(
+                                config["price_group"]
+                            )
+                        ),
+                        source_total=self._to_decimal(
+                            match.group(
+                                config["total_group"]
+                            )
+                        ),
+                    )
 
-                items.append(item)
+                matched_items.append(item)
 
-            if items:
-                break
+            # Щойно один із форматів спрацював,
+            # повертаємо результат і не перевіряємо інші патерни.
+            if matched_items:
+                return matched_items
 
-        return items
+        return []
 
-    def _parse_total(self, text: str) -> Decimal | None:
-        patterns = [
-            re.compile(
-                r"(?:всього до сплати|разом до сплати|"
-                r"всього|разом|total)"
-                r"\s*[:\-]?\s*"
-                r"([\d\s\u00a0]+[,.]\d{2})",
-                re.IGNORECASE,
-            ),
-        ]
+    def _parse_invoice_totals(
+            self,
+            text: str,
+            vat_mode: VatMode,
+    ) -> tuple[Decimal | None, Decimal | None, Decimal]:
+        normalized = text.replace("\u00a0", " ")
 
-        return self._find_decimal(text, patterns)
+        gross_patterns = (
+            r"(?:Всього|Усього|Разом)\s+"
+            r"(?:із|з)\s+ПДВ\s*:?\s*"
+            r"([\d\s\u00a0]+[,.]\d{2})",
+
+            r"(?:Итого|Всего)\s+с\s+НДС\s*:?\s*"
+            r"([\d\s\u00a0]+[,.]\d{2})",
+        )
+
+        vat_patterns = (
+            r"Сума\s+ПДВ\s*:?\s*"
+            r"([\d\s\u00a0]+[,.]\d{2})",
+
+            r"У\s*т\.?\s*ч\.?\s*ПДВ"
+            r"(?:\s*\(\d+%\))?\s*:?\s*"
+            r"([\d\s\u00a0]+[,.]\d{2})",
+
+            r"В\s*т\.?\s*ч\.?\s*НДС"
+            r"(?:\s*\(\d+%\))?\s*:?\s*"
+            r"([\d\s\u00a0]+[,.]\d{2})",
+        )
+
+        base_patterns = (
+            r"(?:Всього|Усього|Разом)\s*:?\s*"
+            r"([\d\s\u00a0]+[,.]\d{2})",
+
+            r"(?:Итого|Всего)\s*:?\s*"
+            r"([\d\s\u00a0]+[,.]\d{2})",
+        )
+
+        gross = self._find_decimal(normalized, gross_patterns)
+        vat = self._find_decimal(normalized, vat_patterns)
+        base = self._find_decimal(normalized, base_patterns)
+
+        if vat_mode == VatMode.EXCLUSIVE:
+            net = base
+
+            if gross is None and net is not None and vat is not None:
+                gross = net + vat
+
+        elif vat_mode == VatMode.INCLUSIVE:
+            gross = gross or base
+            net = gross - vat if gross is not None and vat is not None else None
+
+        elif vat_mode == VatMode.NONE:
+            gross = base
+            net = base
+            vat = Decimal("0.00")
+
+        else:
+            gross = gross or base
+            net = None
+
+        if gross is None:
+            raise ValueError("Не вдалося визначити підсумкову суму рахунку")
+
+        return net, vat, gross
 
     @staticmethod
     def _find_supplier_name(text: str) -> str | None:
@@ -264,19 +416,23 @@ class GenericInvoiceParser:
         ).upper()
 
     def _find_decimal(
-        self,
-        text: str,
-        patterns: list[re.Pattern[str]],
+            self,
+            text: str,
+            patterns: tuple[str, ...],
     ) -> Decimal | None:
         for pattern in patterns:
-            matches = list(pattern.finditer(text))
+            matches = list(
+                re.finditer(
+                    pattern,
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            )
 
             if not matches:
                 continue
 
-            # Для підсумків часто безпечніше брати останній збіг.
             value = matches[-1].group(1)
-
             parsed_value = self._to_decimal(value)
 
             if parsed_value is not None:
