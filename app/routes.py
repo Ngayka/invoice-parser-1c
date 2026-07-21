@@ -15,3 +15,18 @@ async def parse_invoice(file: UploadFile):
     content = await file.read()
 
     return invoice_service.parse_pdf(content)
+
+
+@router.post("/parse-and-save")
+async def parse_and_save(file: UploadFile):
+
+    content = await file.read()
+
+    invoice = invoice_service.parse_pdf(content)
+
+    path = invoice_service.save_json(invoice)
+
+    return {
+        "success": True,
+        "path": str(path),
+    }
