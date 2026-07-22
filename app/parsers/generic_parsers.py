@@ -76,334 +76,316 @@ class GenericInvoiceParser:
         normalized_text = self._normalize_pdf_text(text)
         table_text = self._extract_items_table(normalized_text)
 
-        # 1. Звичайні однорядкові формати.
-        parsed_items: list[InvoiceItem] = []
+        parsers = (
+            self._parse_common_row_items,
+            self._parse_cms_items,
+            self._parse_etna_items,
+            self._parse_common_columnar_items,
+        )
 
-        for line in table_text.splitlines():
-            line = line.strip()
+        for parser in parsers:
+            items = parser(table_text)
+            if self._items_are_valid(items, normalized_text):
+                return items
 
-            if not line:
-                continue
+        raise ValueError(
+            "Не вдалося надійно розпізнати товарні позиції: "
+            "жоден структурний парсер не дав повного результату."
+        )
 
-            if not re.match(r"^\d{1,3}[ \t]+", line):
-                continue
-
-            item = self._parse_item_line(line)
-
-            if item is not None:
-                parsed_items.append(item)
-
-        if parsed_items:
-            return parsed_items
-
-        # 2. Колонковий формат PyMuPDF.
-        parsed_items = self._parse_columnar_items(table_text)
-
-        if parsed_items:
-            return parsed_items
-
-        # 3. Загальний багаторядковий fallback.
-        parsed_items = []
-
-        for block in self._split_multiline_item_blocks(table_text):
-            item = self._parse_item_block(block)
-
-            if item is not None:
-                parsed_items.append(item)
-            else:
-                print("Не вдалося розпізнати товарний блок:")
-                print(repr(block))
-
-        return parsed_items
-
-    def _parse_columnar_items(
-        self,
-        table_text: str,
-    ) -> list[InvoiceItem]:
-        lines = [
-            line.strip()
-            for line in table_text.splitlines()
-            if line.strip()
-        ]
-
-        # Рядок опису:
-        # 1 99-00015445 Назва товару
-        description_pattern = re.compile(
-            r"""
-            ^
-            (?P<number>\d{1,3})
+    def _parse_common_row_items(self, table_text: str) -> list[InvoiceItem]:
+        pattern = re.compile(
+            rf"""
+            ^[ \t]*
+            (?P<number>\d{{1,3}})
             [ \t]+
-            (?:
-                (?P<article>
-                    [A-Za-zА-Яа-яІіЇїЄєҐґ0-9._/\-]+
-                )
-                [ \t]+
-            )?
-            (?P<name>.+)
-            $
+            (?P<body>.+?)
+            [ \t]+
+            (?P<quantity>{QUANTITY_PATTERN})
+            [ \t]+
+            (?P<unit>{UNIT_PATTERN})
+            [ \t]+
+            (?P<price>{PRICE_PATTERN})
+            [ \t]+
+            (?P<total>{AMOUNT_PATTERN})
+            [ \t]*$
             """,
             flags=re.IGNORECASE | re.VERBOSE,
         )
 
-        quantity_pattern = re.compile(
-            rf"^(?P<quantity>{QUANTITY_PATTERN})$"
-        )
-        unit_pattern = re.compile(
-            rf"^(?P<unit>{UNIT_PATTERN})$",
-            flags=re.IGNORECASE,
-        )
-        price_pattern = re.compile(
-            rf"^(?P<price>{PRICE_PATTERN})$"
-        )
-        total_pattern = re.compile(
-            rf"^(?P<total>{AMOUNT_PATTERN})$"
+        items: list[InvoiceItem] = []
+        for raw_line in table_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = pattern.match(line)
+            if match is None:
+                continue
+            item = self._create_invoice_item(match)
+            if item is not None:
+                items.append(item)
+        return items
+
+    def _parse_cms_items(self, table_text: str) -> list[InvoiceItem]:
+        pattern = re.compile(
+            rf"""
+            ^[ \t]*
+            (?P<number>\d{{1,3}})
+            [ \t]+
+            (?P<body>.+?)
+            [ \t]+
+            (?P<unit>{UNIT_PATTERN})
+            [ \t]+
+            (?P<quantity>{QUANTITY_PATTERN})
+            [ \t]+
+            (?P<price>{PRICE_PATTERN})
+            [ \t]+
+            (?P<total>{AMOUNT_PATTERN})
+            [ \t]*$
+            """,
+            flags=re.IGNORECASE | re.VERBOSE,
         )
 
-        parsed_items: list[InvoiceItem] = []
+        items: list[InvoiceItem] = []
+        for raw_line in table_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = pattern.match(line)
+            if match is None:
+                continue
+            item = self._create_invoice_item(match)
+            if item is not None:
+                items.append(item)
+
+        if items:
+            return items
+
+        joined = " ".join(
+            line.strip()
+            for line in table_text.splitlines()
+            if line.strip()
+        )
+        match = pattern.match(joined)
+        if match is None:
+            return []
+        item = self._create_invoice_item(match)
+        return [item] if item is not None else []
+
+    def _parse_etna_items(self, table_text: str) -> list[InvoiceItem]:
+        lines = [line.strip() for line in table_text.splitlines() if line.strip()]
+
+        item_start_pattern = re.compile(r"^\d{1,3}$")
+        quantity_unit_pattern = re.compile(
+            rf"^(?P<quantity>{QUANTITY_PATTERN})[ \t]+(?P<unit>{UNIT_PATTERN})$",
+            flags=re.IGNORECASE,
+        )
+        price_pattern = re.compile(rf"^(?P<price>{PRICE_PATTERN})$")
+        total_pattern = re.compile(rf"^(?P<total>{AMOUNT_PATTERN})$")
+
+        items: list[InvoiceItem] = []
         index = 0
 
         while index < len(lines):
-            description_match = description_pattern.match(lines[index])
-
-            if not description_match:
+            if not item_start_pattern.fullmatch(lines[index]):
                 index += 1
                 continue
 
-            # Щоб не прийняти звичайний службовий рядок за товар,
-            # після опису очікуємо quantity, unit, price, total.
-            if index + 4 >= len(lines):
+            start = index
+            cursor = index + 1
+            quantity_match = None
+
+            while cursor < len(lines):
+                if cursor > start + 1 and item_start_pattern.fullmatch(lines[cursor]):
+                    break
+                quantity_match = quantity_unit_pattern.fullmatch(lines[cursor])
+                if quantity_match is not None:
+                    break
+                cursor += 1
+
+            if quantity_match is None or cursor + 2 >= len(lines):
                 index += 1
                 continue
 
-            quantity_match = quantity_pattern.match(lines[index + 1])
-            unit_match = unit_pattern.match(lines[index + 2])
-            price_match = price_pattern.match(lines[index + 3])
-            total_match = total_pattern.match(lines[index + 4])
-
-            if not (
-                quantity_match
-                and unit_match
-                and price_match
-                and total_match
-            ):
+            price_match = price_pattern.fullmatch(lines[cursor + 1])
+            total_match = total_pattern.fullmatch(lines[cursor + 2])
+            if price_match is None or total_match is None:
                 index += 1
                 continue
 
-            raw_name = description_match.group("name")
-            name = self._clean_item_body(raw_name)
-
-            quantity_value = self._to_decimal(
-                quantity_match.group("quantity")
+            body = " ".join(lines[start + 1:cursor])
+            item = self._build_item_from_parts(
+                body=body,
+                quantity=quantity_match.group("quantity"),
+                unit=quantity_match.group("unit"),
+                price=price_match.group("price"),
+                total=total_match.group("total"),
             )
-            price_value = self._to_decimal(
-                price_match.group("price")
-            )
-            total_value = self._to_decimal(
-                total_match.group("total")
-            )
+            if item is not None:
+                items.append(item)
 
-            if (
-                name
-                and quantity_value is not None
-                and price_value is not None
-                and total_value is not None
-            ):
-                parsed_items.append(
-                    InvoiceItem(
-                        name=name,
-                        unit=self._normalize_unit(
-                            unit_match.group("unit")
-                        ),
-                        quantity=quantity_value,
-                        source_price=price_value,
-                        source_total=total_value,
-                    )
-                )
+            index = cursor + 3
 
-            index += 5
+        return items
 
-        return parsed_items
+    def _parse_common_columnar_items(self, table_text: str) -> list[InvoiceItem]:
+        lines = [line.strip() for line in table_text.splitlines() if line.strip()]
 
-    def _parse_item_line(self, line: str) -> InvoiceItem | None:
-        amount = AMOUNT_PATTERN
-        price = PRICE_PATTERN
-        quantity = QUANTITY_PATTERN
-        unit = UNIT_PATTERN
-
-        flags = re.IGNORECASE | re.VERBOSE
-
-        patterns = (
-            # СТБ, Марчук та інші:
-            # number body quantity unit price total
-            re.compile(
-                rf"""
-                ^[ \t]*
-                \d+
-                [ \t]+
-                (?P<body>.+?)
-                [ \t]+
-                (?P<quantity>{quantity})
-                [ \t]+
-                (?P<unit>{unit})
-                [ \t]+
-                (?P<price>{price})
-                [ \t]+
-                (?P<total>{amount})
-                [ \t]*$
-                """,
-                flags=flags,
-            ),
-
-            # CMS:
-            # number body unit quantity price total
-            re.compile(
-                rf"""
-                ^[ \t]*
-                \d+
-                [ \t]+
-                (?P<body>.+?)
-                [ \t]+
-                (?P<unit>{unit})
-                [ \t]+
-                (?P<quantity>{quantity})
-                [ \t]+
-                (?P<price>{price})
-                [ \t]+
-                (?P<total>{amount})
-                [ \t]*$
-                """,
-                flags=flags,
-            ),
+        description_pattern = re.compile(
+            r"^(?P<number>\d{1,3})[ \t]+(?P<body>.+)$",
+            flags=re.IGNORECASE,
         )
+        quantity_pattern = re.compile(rf"^(?P<quantity>{QUANTITY_PATTERN})$")
+        unit_pattern = re.compile(rf"^(?P<unit>{UNIT_PATTERN})$", flags=re.IGNORECASE)
+        quantity_unit_pattern = re.compile(
+            rf"^(?P<quantity>{QUANTITY_PATTERN})[ \t]+(?P<unit>{UNIT_PATTERN})$",
+            flags=re.IGNORECASE,
+        )
+        price_pattern = re.compile(rf"^(?P<price>{PRICE_PATTERN})$")
+        total_pattern = re.compile(rf"^(?P<total>{AMOUNT_PATTERN})$")
 
-        for pattern in patterns:
-            match = pattern.match(line)
+        items: list[InvoiceItem] = []
+        index = 0
 
-            if match:
-                return self._create_invoice_item(match)
+        while index < len(lines):
+            description_match = description_pattern.fullmatch(lines[index])
+            if description_match is None:
+                index += 1
+                continue
 
-        return None
+            body = description_match.group("body")
 
-    def _split_multiline_item_blocks(
+            if index + 3 < len(lines):
+                quantity_unit_match = quantity_unit_pattern.fullmatch(lines[index + 1])
+                price_match = price_pattern.fullmatch(lines[index + 2])
+                total_match = total_pattern.fullmatch(lines[index + 3])
+                if quantity_unit_match and price_match and total_match:
+                    item = self._build_item_from_parts(
+                        body=body,
+                        quantity=quantity_unit_match.group("quantity"),
+                        unit=quantity_unit_match.group("unit"),
+                        price=price_match.group("price"),
+                        total=total_match.group("total"),
+                    )
+                    if item is not None:
+                        items.append(item)
+                    index += 4
+                    continue
+
+            if index + 4 < len(lines):
+                quantity_match = quantity_pattern.fullmatch(lines[index + 1])
+                unit_match = unit_pattern.fullmatch(lines[index + 2])
+                price_match = price_pattern.fullmatch(lines[index + 3])
+                total_match = total_pattern.fullmatch(lines[index + 4])
+                if quantity_match and unit_match and price_match and total_match:
+                    item = self._build_item_from_parts(
+                        body=body,
+                        quantity=quantity_match.group("quantity"),
+                        unit=unit_match.group("unit"),
+                        price=price_match.group("price"),
+                        total=total_match.group("total"),
+                    )
+                    if item is not None:
+                        items.append(item)
+                    index += 5
+                    continue
+
+            index += 1
+
+        return items
+
+    def _build_item_from_parts(
             self,
-            table_text: str,
-    ) -> list[str]:
-        normalized = self._normalize_pdf_text(table_text)
+            *,
+            body: str,
+            quantity: str,
+            unit: str,
+            price: str,
+            total: str,
+    ) -> InvoiceItem | None:
+        name = self._clean_item_body(body)
+        quantity_value = self._to_decimal(quantity)
+        price_value = self._to_decimal(price)
+        total_value = self._to_decimal(total)
 
-        lines = normalized.splitlines()
-        blocks: list[list[str]] = []
-        current_block: list[str] = []
+        if not name or quantity_value is None or price_value is None or total_value is None:
+            return None
 
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-
-            if not stripped:
-                continue
-
-            is_item_start = bool(
-                re.match(
-                    r"^\d{1,3}(?:[ \t]+.+)?$",
-                    stripped,
-                )
-            )
-
-            # Рядок лише з числом може бути як номером позиції,
-            # так і кількістю. Вважаємо його номером позиції,
-            # тільки якщо наступний рядок схожий на назву товару.
-            if re.fullmatch(r"\d{1,3}", stripped):
-                next_line = (
-                    lines[index + 1].strip()
-                    if index + 1 < len(lines)
-                    else ""
-                )
-
-                next_is_text = bool(
-                    next_line
-                    and not re.fullmatch(QUANTITY_PATTERN, next_line)
-                    and not re.fullmatch(
-                        UNIT_PATTERN,
-                        next_line,
-                        flags=re.IGNORECASE,
-                    )
-                    and not re.fullmatch(PRICE_PATTERN, next_line)
-                )
-
-                is_item_start = next_is_text
-
-            if is_item_start and current_block:
-                blocks.append(current_block)
-                current_block = []
-
-            current_block.append(stripped)
-
-        if current_block:
-            blocks.append(current_block)
-
-        return [
-            "\n".join(block)
-            for block in blocks
-            if block
-        ]
-
-    def _parse_item_block(self, block: str) -> InvoiceItem | None:
-        normalized = self._normalize_pdf_text(block)
-
-        amount = AMOUNT_PATTERN
-        price = PRICE_PATTERN
-        quantity = QUANTITY_PATTERN
-        unit = UNIT_PATTERN
-
-        flags = re.IGNORECASE | re.DOTALL | re.VERBOSE
-
-        patterns = (
-            # Багаторядковий звичайний формат:
-            # number body quantity unit price total
-            re.compile(
-                rf"""
-                ^[ \t]*
-                \d+
-                [ \t\r\n]+
-                (?P<body>.+?)
-                [ \t\r\n]+
-                (?P<quantity>{quantity})
-                [ \t\r\n]+
-                (?P<unit>{unit})
-                [ \t\r\n]+
-                (?P<price>{price})
-                [ \t\r\n]+
-                (?P<total>{amount})
-                [ \t\r\n]*$
-                """,
-                flags=flags,
-            ),
-
-            # Багаторядковий CMS:
-            # number body unit quantity price total
-            re.compile(
-                rf"""
-                ^[ \t]*
-                \d+
-                [ \t\r\n]+
-                (?P<body>.+?)
-                [ \t\r\n]+
-                (?P<unit>{unit})
-                [ \t\r\n]+
-                (?P<quantity>{quantity})
-                [ \t\r\n]+
-                (?P<price>{price})
-                [ \t\r\n]+
-                (?P<total>{amount})
-                [ \t\r\n]*$
-                """,
-                flags=flags,
-            ),
+        return InvoiceItem(
+            name=name,
+            unit=self._normalize_unit(unit),
+            quantity=quantity_value,
+            source_price=price_value,
+            source_total=total_value,
         )
 
-        for pattern in patterns:
-            match = pattern.match(normalized)
+    def _items_are_valid(self, items: list[InvoiceItem], invoice_text: str) -> bool:
+        if not items:
+            return False
 
-            if match:
-                return self._create_invoice_item(match)
+        expected_count = self._parse_expected_items_count(invoice_text)
+        if expected_count is not None and len(items) != expected_count:
+            return False
+
+        expected_total = self._parse_expected_items_total(invoice_text)
+        if expected_total is None:
+            return all(
+                item.quantity > 0
+                and item.source_price >= 0
+                and item.source_total >= 0
+                for item in items
+            )
+
+        actual_total = sum(
+            (item.source_total for item in items),
+            start=Decimal("0.00"),
+        )
+        return abs(actual_total - expected_total) <= Decimal("0.01")
+
+    def _parse_expected_items_count(self, text: str) -> int | None:
+        match = re.search(
+            r"Всього[ \t]+найменувань[ \t]+(?P<count>\d+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return int(match.group("count")) if match else None
+
+    def _parse_expected_items_total(self, text: str) -> Decimal | None:
+        normalized = self._normalize_pdf_text(text)
+        amount = AMOUNT_PATTERN
+
+        explicit_net_patterns = (
+            rf"(?mi)^\s*(?:Всього|Усього|Разом)\s+без\s+ПДВ\s*:?\s*({amount})\s*$",
+            rf"(?mi)^\s*(?:Итого|Всего)\s+без\s+НДС\s*:?\s*({amount})\s*$",
+        )
+
+        for pattern in explicit_net_patterns:
+            matches = list(re.finditer(pattern, normalized))
+            if matches:
+                return self._to_decimal(matches[-1].group(1))
+
+        vat_marker = re.search(r"(?mi)^\s*(?:Сума\s+ПДВ|ПДВ)\s*: ?", normalized)
+        if vat_marker is not None:
+            before_vat = normalized[:vat_marker.start()]
+            matches = list(
+                re.finditer(
+                    rf"(?mi)^\s*(?:Всього|Усього|Разом)\s*:?\s*({amount})\s*$",
+                    before_vat,
+                )
+            )
+            if matches:
+                return self._to_decimal(matches[-1].group(1))
+
+        common_patterns = (
+            rf"(?mi)^\s*(?:Всього|Усього|Разом)\s+(?:із|з)\s+ПДВ\s*:?\s*({amount})\s*$",
+            rf"(?mi)^\s*(?:Всього|Усього|Разом)\s*:?\s*({amount})\s*$",
+            rf"(?mi)^\s*(?:Итого|Всего)\s*:?\s*({amount})\s*$",
+        )
+
+        for pattern in common_patterns:
+            matches = list(re.finditer(pattern, normalized))
+            if matches:
+                return self._to_decimal(matches[-1].group(1))
 
         return None
 
