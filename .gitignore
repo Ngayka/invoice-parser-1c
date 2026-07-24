@@ -1,3 +1,30 @@
-.idea
-.venv
-__pycache__
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+
+# Environment variables
+.env
+
+# Generated invoice data
+exports/*
+processed/*
+
+# Keep directories in Git
+!exports/.gitkeep
+!processed/.gitkeep
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
