@@ -1,0 +1,60 @@
+{
+    "number": "99-49465",
+    "date": "2026-07-23",
+    "supplier": {
+        "name": "ТОВ \"ВІАТЕК\"",
+        "tax_code": "36413740",
+        "iban": "UA983348510000000026003238732"
+    },
+    "items": [
+        {
+            "name": "Ajax Hub 2 (8EU) UA white охоронна централь",
+            "unit": "шт",
+            "quantity": "1",
+            "source_price": "6392.25",
+            "source_total": "6392.25",
+            "price_net": null,
+            "price_gross": null,
+            "total_net": null,
+            "total_gross": null
+        },
+        {
+            "name": "Ajax ReX (8EU) ASP white ретранслятор сигналу",
+            "unit": "шт",
+            "quantity": "1",
+            "source_price": "3195.90",
+            "source_total": "3195.90",
+            "price_net": null,
+            "price_gross": null,
+            "total_net": null,
+            "total_gross": null
+        },
+        {
+            "name": "Ajax LeaksProtect white EU датчик затоплення",
+            "unit": "шт",
+            "quantity": "5",
+            "source_price": "1278.45",
+            "source_total": "6392.25",
+            "price_net": null,
+            "price_gross": null,
+            "total_net": null,
+            "total_gross": null
+        },
+        {
+            "name": "Ajax LeaksProtect white EU датчик затоплення",
+            "unit": "шт",
+            "quantity": "1",
+            "source_price": "1278.45",
+            "source_total": "1278.45",
+            "price_net": null,
+            "price_gross": null,
+            "total_net": null,
+            "total_gross": null
+        }
+    ],
+    "vat_mode": "inclusive",
+    "vat_rate": null,
+    "total_net": "14382.37",
+    "vat_total": "2876.48",
+    "total_gross": "17258.85"
+}

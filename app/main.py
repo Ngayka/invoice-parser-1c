@@ -1,5 +1,6 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, Request
 from app.routes import router as invoice_router
+from fastapi.templating import Jinja2Templates
 
 
 app = FastAPI(
@@ -12,3 +13,23 @@ app.include_router(
     prefix="/api/invoices",
     tags=["Invoices"],
 )
+
+templates = Jinja2Templates(directory="app/templates")
+
+
+@app.get("/")
+async def home(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="invoice_parser.html",
+        context={}
+    )
+
+
+@app.get("/save")
+async def home(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="invoice_parser_save.html",
+        context={}
+    )

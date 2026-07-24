@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile
+from fastapi import APIRouter, UploadFile, HTTPException
 
 from app.schemas.invoice import InvoiceData
 from app.services.invoice_service import InvoiceService
@@ -25,8 +25,14 @@ async def parse_and_save(file: UploadFile):
     invoice = invoice_service.parse_pdf(content)
 
     path = invoice_service.save_json(invoice)
+    try:
+        return {
+            "success": True,
+            "message": "Документ успішно збережено. Перейдіть до завантаження документа в 1С."
+        }
 
-    return {
-        "success": True,
-        "path": str(path),
-    }
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не вдалося обробити рахунок: {error}",
+        )

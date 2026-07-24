@@ -1,0 +1,27 @@
+{
+    "number": "173300",
+    "date": "2026-07-24",
+    "supplier": {
+        "name": "Товариство з обмеженою відповідальністю \"СІ ЕМ ЕС\"",
+        "tax_code": "41115979",
+        "iban": "UA343003350000000026002559739"
+    },
+    "items": [
+        {
+            "name": "SC/SC(SM)S(DE) 700000 Адаптер (з'єднувач) SC/SC SM Simplex",
+            "unit": "шт",
+            "quantity": "23.00",
+            "source_price": "8.70",
+            "source_total": "200.10",
+            "price_net": null,
+            "price_gross": null,
+            "total_net": null,
+            "total_gross": null
+        }
+    ],
+    "vat_mode": "exclusive",
+    "vat_rate": null,
+    "total_net": "200.10",
+    "vat_total": "40.02",
+    "total_gross": "240.12"
+}

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Invoice Parser</title>
+</head>
+<body>
+
+    <h1>Переносимо рахунок в 1С</h1>
+
+    <form action="/api/invoices/parse-and-save"
+          method="post"
+          enctype="multipart/form-data">
+
+        <label for="file">
+            Обрати рахунок в форматі PDF:
+        </label>
+
+        <br><br>
+
+        <input
+            type="file"
+            id="file"
+            name="file"
+            accept=".pdf"
+            required>
+
+        <br><br>
+
+        <button type="submit">
+            Зберегти рахунок
+        </button>
+
+    </form>
+
+</body>
+</html>
