@@ -1,19 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="uk">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
     <title>Invoice Parser</title>
 </head>
 <body>
 
     <h1>Переносимо рахунок в 1С</h1>
 
-    <form action="/api/invoices/parse-and-save"
-          method="post"
-          enctype="multipart/form-data">
-
+    <form id="upload-form">
         <label for="file">
-            Обрати рахунок в форматі PDF:
+            Обрати рахунок у форматі PDF:
         </label>
 
         <br><br>
@@ -22,16 +21,93 @@
             type="file"
             id="file"
             name="file"
-            accept=".pdf"
-            required>
+            accept=".pdf,application/pdf"
+            required
+        >
 
         <br><br>
 
-        <button type="submit">
+        <button type="submit" id="submit-button">
             Зберегти рахунок
         </button>
-
     </form>
+
+    <br>
+
+    <div id="message"></div>
+
+    <script>
+        // Знаходимо елементи HTML-сторінки за їхніми id.
+        const form = document.getElementById("upload-form");
+        const fileInput = document.getElementById("file");
+        const submitButton = document.getElementById("submit-button");
+        const messageElement = document.getElementById("message");
+
+        // Ця функція виконається після натискання кнопки
+        // "Зберегти рахунок".
+        form.addEventListener("submit", async function (event) {
+            // Не даємо браузеру виконати стандартне надсилання форми
+            // і перейти на сторінку з JSON.
+            event.preventDefault();
+
+            // Перевіряємо, чи справді вибрано файл.
+            if (fileInput.files.length === 0) {
+                messageElement.textContent = "Будь ласка, оберіть PDF-файл.";
+                return;
+            }
+
+            // Створюємо FormData — контейнер для передавання файла.
+            const formData = new FormData();
+
+            // Назва "file" повинна збігатися з параметром:
+            // async def parse_and_save(file: UploadFile)
+            formData.append("file", fileInput.files[0]);
+
+            // Поки файл обробляється, блокуємо кнопку,
+            // щоб користувач не надіслав його двічі.
+            submitButton.disabled = true;
+            submitButton.textContent = "Обробка...";
+
+            messageElement.textContent = "Рахунок обробляється...";
+
+            try {
+                // Надсилаємо PDF на FastAPI.
+                const response = await fetch(
+                    "/api/invoices/parse-and-save",
+                    {
+                        method: "POST",
+                        body: formData
+                    }
+                );
+
+                // Читаємо JSON, який повернув FastAPI.
+                const result = await response.json();
+
+                // response.ok дорівнює true для статусів 200–299.
+                if (!response.ok) {
+                    throw new Error(
+                        result.detail || "Не вдалося обробити рахунок."
+                    );
+                }
+
+                // Показуємо повідомлення від FastAPI.
+                messageElement.textContent = result.message;
+
+                // Очищаємо поле вибору файла.
+                // Після цього можна одразу вибрати наступний рахунок.
+                form.reset();
+
+            } catch (error) {
+                messageElement.textContent =
+                    "Помилка: " + error.message;
+
+            } finally {
+                // Цей блок виконується і після успіху, і після помилки.
+                submitButton.disabled = false;
+                submitButton.textContent = "Зберегти рахунок";
+            }
+        });
+    </script>
 
 </body>
 </html>

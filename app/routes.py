@@ -19,13 +19,11 @@ async def parse_invoice(file: UploadFile):
 
 @router.post("/parse-and-save")
 async def parse_and_save(file: UploadFile):
-
-    content = await file.read()
-
-    invoice = invoice_service.parse_pdf(content)
-
-    path = invoice_service.save_json(invoice)
     try:
+        content = await file.read()
+        invoice = invoice_service.parse_pdf(content)
+        path = invoice_service.save_json(invoice)
+
         return {
             "success": True,
             "message": "Документ успішно збережено. Перейдіть до завантаження документа в 1С."
