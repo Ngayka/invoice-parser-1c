@@ -161,16 +161,31 @@ class GenericInvoiceParser:
         if items:
             return items
 
-        joined = " ".join(
-            line.strip()
-            for line in table_text.splitlines()
-            if line.strip()
+        lines = [line.strip() for line in table_text.splitlines() if line.strip()]
+        item_start_pattern = re.compile(r"^\d{1,3}$")
+        starts = [
+            index
+            for index, line in enumerate(lines)
+            if item_start_pattern.fullmatch(line)
+        ] or [0]
+        boundaries = starts + [len(lines)]
+        quantity_unit_pattern = re.compile(
+            rf"^{QUANTITY_PATTERN}[ \t]+{UNIT_PATTERN}$",
+            flags=re.IGNORECASE,
         )
-        match = pattern.match(joined)
-        if match is None:
-            return []
-        item = self._create_invoice_item(match)
-        return [item] if item is not None else []
+
+        for start, end in zip(boundaries, boundaries[1:]):
+            # Preserve the quantity + unit row boundary before joining columns.
+            if end - start >= 3 and quantity_unit_pattern.fullmatch(lines[end - 3]):
+                continue
+            joined = " ".join(lines[start:end])
+            match = pattern.match(joined)
+            if match is None:
+                continue
+            item = self._create_invoice_item(match)
+            if item is not None:
+                items.append(item)
+        return items
 
     def _parse_etna_items(self, table_text: str) -> list[InvoiceItem]:
         lines = [line.strip() for line in table_text.splitlines() if line.strip()]
