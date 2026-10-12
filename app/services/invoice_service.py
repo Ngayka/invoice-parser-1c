@@ -18,7 +18,7 @@ class InvoiceService:
 
         text = self.pdf_reader.extract_text(content)
 
-        return self.parser.parse(text)
+        return self.parser.parse(text, pdf_content=content)
 
     def save_json(self, invoice: InvoiceData) -> Path:
         directory = Path("exports")

@@ -2,6 +2,8 @@ import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
+import pymupdf
+
 from app.schemas.invoice import (
     InvoiceData,
     InvoiceItem,
@@ -52,9 +54,16 @@ UNIT_PATTERN = (
 
 
 class GenericInvoiceParser:
-    def parse(self, text: str) -> InvoiceData:
+    def parse(self, text: str, *, pdf_content: bytes | None = None) -> InvoiceData:
         text = self._normalize_pdf_text(text)
-        vat_mode = detect_vat_mode(text)
+        # Text-only extraction can separate descriptions from their numeric rows.
+        # Recover those tables from coordinates, without changing other formats.
+        if pdf_content is not None and re.search(
+            rf"(?m)^1\n{UNIT_PATTERN}\n{QUANTITY_PATTERN}\n", text,
+            re.IGNORECASE,
+        ):
+            text = self._restore_columnar_pdf_text(pdf_content) or text
+        vat_mode = self._detect_vat_mode(text)
 
         total_net, vat_total, total_gross = self._parse_invoice_totals(
             text,
@@ -72,9 +81,91 @@ class GenericInvoiceParser:
             total_gross=total_gross,
         )
 
+    @staticmethod
+    def _detect_vat_mode(text: str) -> VatMode:
+        totals = re.search(r"(?mi)^[ \t]*(?:Всього|Усього|Разом)[ \t]*:", text)
+        if totals and re.search(r"(?mi)^[ \t]*Без[ \t]+ПДВ[ \t]*$", text[totals.end():]):
+            return VatMode.NONE
+        return detect_vat_mode(text)
+
+    def _restore_columnar_pdf_text(self, content: bytes) -> str | None:
+        """Rebuild a name/unit/quantity/price/total table using PDF coordinates."""
+        pages = []
+        restored = False
+        with pymupdf.open(stream=content, filetype="pdf") as document:
+            for page in document:
+                words = page.get_text("words")
+                ordered = page.get_text("text", sort=True)
+                header = re.search(
+                    r"(?m)^[ \t]*№[ \t]+Назва[ \t]+Од\.[ \t]+Кількість"
+                    r"[ \t]+Ціна без ПДВ[ \t]+Сума без ПДВ[^\n]*\n", ordered,
+                )
+                if header is None:
+                    pages.append(ordered)
+                    continue
+                number_header = next((w for w in words if w[4] == "№"), None)
+                if number_header is None:
+                    return None
+                columns = []
+                for label in ("Од.", "Кількість", "Ціна", "Сума"):
+                    column = next((w for w in words if w[4] == label
+                                   and abs(w[1] - number_header[1]) < 3), None)
+                    if column is None:
+                        return None
+                    columns.append(column[0])
+                total_word = next((w for w in sorted(words, key=lambda w: w[1])
+                                   if w[4] in ("Всього:", "Усього:", "Разом:")
+                                   and w[1] > number_header[3]), None)
+                if total_word is None:
+                    return None
+                anchors = sorted((w for w in words if w[4].isdigit()
+                                  and number_header[0] <= w[0] < number_header[2] + 6
+                                  and number_header[3] < w[1] < total_word[1]), key=lambda w: w[1])
+                if not anchors or [int(w[4]) for w in anchors] != list(range(1, len(anchors) + 1)):
+                    return None
+                rows = []
+                for index, anchor in enumerate(anchors):
+                    bottom = anchors[index + 1][1] - 1 if index + 1 < len(anchors) else total_word[1] - 1
+                    row_words = sorted((w for w in words if anchor[1] - 1 <= w[1] < bottom
+                                        and w[0] > anchor[2]), key=lambda w: (round(w[1]), w[0]))
+                    cells = [[] for _ in range(5)]
+                    for word in row_words:
+                        column = sum(word[0] >= boundary - 1 for boundary in columns)
+                        cells[column].append(word[4])
+                    name, unit, quantity, price, total = (" ".join(cell) for cell in cells)
+                    # Join a wrapped numeric range, retaining its original hyphen.
+                    name = re.sub(r"(?<=\d)-[ \t]+(?=\d)", "-", name)
+                    if not (name and re.fullmatch(UNIT_PATTERN, unit, re.IGNORECASE)
+                            and re.fullmatch(QUANTITY_PATTERN, quantity)
+                            and re.fullmatch(PRICE_PATTERN, price)
+                            and re.fullmatch(AMOUNT_PATTERN, total)):
+                        return None
+                    rows.append(f"{anchor[4]} {name} {quantity} {unit} {price} {total}")
+                totals = re.search(r"(?m)^[ \t]*(?:Всього|Усього|Разом)[ \t]*:", ordered[header.end():])
+                if totals is None:
+                    return None
+                pages.append(ordered[:header.start()] + "Сума\n" + "\n".join(rows)
+                             + "\n" + ordered[header.end() + totals.start():])
+                restored = True
+        return self._normalize_pdf_text("\n".join(pages)) if restored else None
+
     def _parse_items(self, text: str) -> list[InvoiceItem]:
         normalized_text = self._normalize_pdf_text(text)
         table_text = self._extract_items_table(normalized_text)
+
+        header = normalized_text.split(table_text, 1)[0]
+        code_column = None
+        if re.search(r"№\s+Код\s+Товари", header, re.IGNORECASE):
+            code_column = "code"
+        elif re.search(r"№\s+Артикул\s+Найменування", header, re.IGNORECASE):
+            code_column = "cms"
+        elif re.search(r"№\s+Артикул\s+Товари", header, re.IGNORECASE):
+            code_column = "etna"
+
+        if re.search(r"Ставка\s+ПДВ\s+Сума\s+ПДВ", header, re.IGNORECASE):
+            items = self._parse_vat_column_items(table_text)
+            if self._items_are_valid(items, normalized_text):
+                return items
 
         parsers = (
             self._parse_common_row_items,
@@ -84,7 +175,7 @@ class GenericInvoiceParser:
         )
 
         for parser in parsers:
-            items = parser(table_text)
+            items = parser(table_text, code_column=code_column)
             if self._items_are_valid(items, normalized_text):
                 return items
 
@@ -93,7 +184,31 @@ class GenericInvoiceParser:
             "жоден структурний парсер не дав повного результату."
         )
 
-    def _parse_common_row_items(self, table_text: str) -> list[InvoiceItem]:
+    def _parse_vat_column_items(self, table_text: str) -> list[InvoiceItem]:
+        pattern = re.compile(
+            rf"(?m)^[ \t]*(?P<number>\d{{1,3}})[ \t]+(?P<code>[^\n]+)\n"
+            rf"(?P<name>(?:[^\n]+\n)+?)"
+            rf"(?P<quantity>{QUANTITY_PATTERN})\n(?P<unit>{UNIT_PATTERN})\n"
+            rf"(?P<price>{PRICE_PATTERN})\n\d+(?:[,.]\d+)?%\n"
+            rf"{AMOUNT_PATTERN}\n(?P<total>{AMOUNT_PATTERN})(?=\n|$)",
+            re.IGNORECASE,
+        )
+        items = []
+        for match in pattern.finditer(table_text):
+            if int(match.group("number")) != len(items) + 1:
+                return []
+            item = self._build_item_from_parts(
+                body=match.group("name"), quantity=match.group("quantity"),
+                unit=match.group("unit"), price=match.group("price"),
+                total=match.group("total"),
+            )
+            if item is None:
+                return []
+            item.product_code = match.group("code").strip()
+            items.append(item)
+        return items
+
+    def _parse_common_row_items(self, table_text: str, *, code_column: str | None = None) -> list[InvoiceItem]:
         pattern = re.compile(
             rf"""
             ^[ \t]*
@@ -121,12 +236,12 @@ class GenericInvoiceParser:
             match = pattern.match(line)
             if match is None:
                 continue
-            item = self._create_invoice_item(match)
+            item = self._create_invoice_item(match, code_column=code_column)
             if item is not None:
                 items.append(item)
         return items
 
-    def _parse_cms_items(self, table_text: str) -> list[InvoiceItem]:
+    def _parse_cms_items(self, table_text: str, *, code_column: str | None = None) -> list[InvoiceItem]:
         pattern = re.compile(
             rf"""
             ^[ \t]*
@@ -154,7 +269,7 @@ class GenericInvoiceParser:
             match = pattern.match(line)
             if match is None:
                 continue
-            item = self._create_invoice_item(match)
+            item = self._create_invoice_item(match, code_column=code_column)
             if item is not None:
                 items.append(item)
 
@@ -182,12 +297,12 @@ class GenericInvoiceParser:
             match = pattern.match(joined)
             if match is None:
                 continue
-            item = self._create_invoice_item(match)
+            item = self._create_invoice_item(match, code_column=code_column)
             if item is not None:
                 items.append(item)
         return items
 
-    def _parse_etna_items(self, table_text: str) -> list[InvoiceItem]:
+    def _parse_etna_items(self, table_text: str, *, code_column: str | None = None) -> list[InvoiceItem]:
         lines = [line.strip() for line in table_text.splitlines() if line.strip()]
 
         item_start_pattern = re.compile(r"^\d{1,3}$")
@@ -231,6 +346,7 @@ class GenericInvoiceParser:
             body = " ".join(lines[start + 1:cursor])
             item = self._build_item_from_parts(
                 body=body,
+                code_column=code_column,
                 quantity=quantity_match.group("quantity"),
                 unit=quantity_match.group("unit"),
                 price=price_match.group("price"),
@@ -243,7 +359,7 @@ class GenericInvoiceParser:
 
         return items
 
-    def _parse_common_columnar_items(self, table_text: str) -> list[InvoiceItem]:
+    def _parse_common_columnar_items(self, table_text: str, *, code_column: str | None = None) -> list[InvoiceItem]:
         lines = [line.strip() for line in table_text.splitlines() if line.strip()]
 
         description_pattern = re.compile(
@@ -277,6 +393,7 @@ class GenericInvoiceParser:
                 if quantity_unit_match and price_match and total_match:
                     item = self._build_item_from_parts(
                         body=body,
+                        code_column=code_column,
                         quantity=quantity_unit_match.group("quantity"),
                         unit=quantity_unit_match.group("unit"),
                         price=price_match.group("price"),
@@ -295,6 +412,7 @@ class GenericInvoiceParser:
                 if quantity_match and unit_match and price_match and total_match:
                     item = self._build_item_from_parts(
                         body=body,
+                        code_column=code_column,
                         quantity=quantity_match.group("quantity"),
                         unit=unit_match.group("unit"),
                         price=price_match.group("price"),
@@ -313,12 +431,13 @@ class GenericInvoiceParser:
             self,
             *,
             body: str,
+            code_column: str | None = None,
             quantity: str,
             unit: str,
             price: str,
             total: str,
     ) -> InvoiceItem | None:
-        name = self._clean_item_body(body)
+        product_code, name = self._split_item_body(body, code_column)
         quantity_value = self._to_decimal(quantity)
         price_value = self._to_decimal(price)
         total_value = self._to_decimal(total)
@@ -328,6 +447,7 @@ class GenericInvoiceParser:
 
         return InvoiceItem(
             name=name,
+            product_code=product_code,
             unit=self._normalize_unit(unit),
             quantity=quantity_value,
             source_price=price_value,
@@ -359,7 +479,7 @@ class GenericInvoiceParser:
 
     def _parse_expected_items_count(self, text: str) -> int | None:
         match = re.search(
-            r"Всього[ \t]+найменувань[ \t]+(?P<count>\d+)",
+            r"(?:Всього|Усього)[ \t]+найменувань[ \t]+(?P<count>\d+)",
             text,
             flags=re.IGNORECASE,
         )
@@ -379,7 +499,10 @@ class GenericInvoiceParser:
             if matches:
                 return self._to_decimal(matches[-1].group(1))
 
-        vat_marker = re.search(r"(?mi)^\s*(?:Сума\s+ПДВ|ПДВ)\s*: ?", normalized)
+        vat_marker = re.search(
+            r"(?mi)^\s*(?:Сума\s+ПДВ|ПДВ)(?:\s*\(\s*\d+(?:[,.]\d+)?\s*%\s*\))?\s*:",
+            normalized,
+        )
         if vat_marker is not None:
             before_vat = normalized[:vat_marker.start()]
             matches = list(
@@ -407,25 +530,46 @@ class GenericInvoiceParser:
     def _create_invoice_item(
         self,
         match: re.Match[str],
+        *,
+        code_column: str | None = None,
     ) -> InvoiceItem | None:
-        name = self._clean_item_body(match.group("body"))
-        quantity = self._to_decimal(match.group("quantity"))
-        price = self._to_decimal(match.group("price"))
-        total = self._to_decimal(match.group("total"))
-
-        if not name:
-            return None
-
-        if quantity is None or price is None or total is None:
-            return None
-
-        return InvoiceItem(
-            name=name,
-            unit=self._normalize_unit(match.group("unit")),
-            quantity=quantity,
-            source_price=price,
-            source_total=total,
+        return self._build_item_from_parts(
+            body=match.group("body"),
+            code_column=code_column,
+            quantity=match.group("quantity"),
+            unit=match.group("unit"),
+            price=match.group("price"),
+            total=match.group("total"),
         )
+
+    def _split_item_body(self, body: str, code_column: str | None) -> tuple[str | None, str]:
+        value = " ".join(body.split())
+        if code_column == "cms":
+            # Customs precede the name; the origin suffix is not part of the SKU.
+            match = re.fullmatch(
+                r"(?P<code>.+?)\s+УКТ\s*ЗЕД\s*:\s*\d{10}\s+(?P<name>.+)",
+                value, re.IGNORECASE,
+            )
+            if match:
+                code = re.sub(r"\s+(?:імпорт|импорт)$", "", match.group("code"), flags=re.IGNORECASE)
+                return code, self._clean_item_body(match.group("name"))
+        elif code_column == "etna":
+            # Customs digits may wrap across lines: 391739009 / 0.
+            value = re.sub(
+                r"^УКТ\s*ЗЕД\s*(?:\d\s*){10}(?:укр\.?|імп\.?)?\s*",
+                "", value, flags=re.IGNORECASE,
+            )
+            match = re.fullmatch(
+                r"(?P<code>(?:[A-Za-z]+\s+)?[A-Za-z0-9]+[A-Za-z0-9_/.-]*[_/-][A-Za-z0-9_/.-]+)\s+(?P<name>.+)",
+                value,
+            )
+            if match:
+                return match.group("code"), self._clean_item_body(match.group("name"))
+        elif code_column == "code":
+            match = re.fullmatch(r"(?P<code>99-\d{8})\s+(?P<name>.+)", value)
+            if match:
+                return match.group("code"), self._clean_item_body(match.group("name"))
+        return None, self._clean_item_body(body)
 
     @staticmethod
     def _clean_item_body(body: str) -> str:
@@ -465,25 +609,6 @@ class GenericInvoiceParser:
         )
 
         value = re.sub(r"\s{2,}", " ", value).strip()
-
-        # Видаляємо артикул на початку, лише якщо він явно схожий на код.
-        parts = value.split(maxsplit=1)
-
-        if len(parts) == 2:
-            possible_article, possible_name = parts
-
-            article_looks_like_code = (
-                any(char.isdigit() for char in possible_article)
-                and (
-                    "-" in possible_article
-                    or "_" in possible_article
-                    or "/" in possible_article
-                    or possible_article.upper().startswith("CMS")
-                )
-            )
-
-            if article_looks_like_code:
-                value = possible_name.strip()
 
         return value
 
@@ -534,6 +659,9 @@ class GenericInvoiceParser:
             ),
             re.compile(
                 r"(?mi)^\s*Supplier\s*:\s*(.+?)\s*$"
+            ),
+            re.compile(
+                r"(?mi)^[ \t]*Постачальник[ \t]+((?:ФОП|ТОВ)\b[^\n]+)[ \t]*$"
             ),
         )
 
@@ -811,7 +939,7 @@ class GenericInvoiceParser:
         vat_patterns = (
             rf"(?mi)^\s*Сума\s+ПДВ\s*:?\s*({amount})\s*$",
             rf"(?mi)^\s*ПДВ"
-            rf"(?:\s+\d+(?:[,.]\d+)?\s*%)?"
+            rf"(?:\s+\d+(?:[,.]\d+)?\s*%|\s*\(\s*\d+(?:[,.]\d+)?\s*%\s*\))?"
             rf"\s*:?\s*({amount})\s*$",
             rf"(?mi)^\s*У\s*"
             rf"(?:т\.?\s*ч\.?|тому\s+числі)"

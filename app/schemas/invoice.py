@@ -12,6 +12,7 @@ class SupplierRaw(BaseModel):
 
 class InvoiceItem(BaseModel):
     name: str
+    product_code: str | None = None
     unit: str
     quantity: Decimal
 
